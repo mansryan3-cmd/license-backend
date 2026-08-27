@@ -17,15 +17,15 @@ from pydantic import BaseModel
 
 APP_NAME = "SecureApp License Server"
 
-# Change this on Render using an environment variable called ADMIN_SECRET.
-# Do NOT leave the default value for a real deployment.
+# Set this in Render:
+# Environment -> ADMIN_SECRET
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_THIS_ADMIN_SECRET")
 
 DATABASE_PATH = Path("licenses.db")
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.0"
+    version="2.0.0"
 )
 
 
@@ -82,6 +82,10 @@ def datetime_to_string(value):
 
 
 def string_to_datetime(value):
+
+    if not value:
+        return None
+
     return datetime.fromisoformat(value)
 
 
@@ -166,11 +170,61 @@ def calculate_expiration(
 
 def get_time_remaining(expires_at):
 
+    if not expires_at:
+        return 0
+
     remaining = int(
         (expires_at - now_utc()).total_seconds()
     )
 
     return max(0, remaining)
+
+
+def get_license_status(license_data):
+
+    if license_data["revoked"]:
+        return "revoked"
+
+    if not license_data["activated"]:
+        return "not_activated"
+
+    expires_at = string_to_datetime(
+        license_data["expires_at"]
+    )
+
+    if expires_at and now_utc() >= expires_at:
+        return "expired"
+
+    return "active"
+
+
+def license_to_dict(license_data):
+
+    data = dict(license_data)
+
+    expires_at = string_to_datetime(
+        data.get("expires_at")
+    )
+
+    data["status"] = get_license_status(
+        license_data
+    )
+
+    data["activated"] = bool(
+        data["activated"]
+    )
+
+    data["revoked"] = bool(
+        data["revoked"]
+    )
+
+    data["seconds_remaining"] = (
+        get_time_remaining(expires_at)
+        if expires_at
+        else 0
+    )
+
+    return data
 
 
 def check_admin_secret(x_admin_secret):
@@ -208,6 +262,14 @@ class ValidateKeyRequest(BaseModel):
 
 
 class RevokeKeyRequest(BaseModel):
+    license_key: str
+
+
+class ResetHWIDRequest(BaseModel):
+    license_key: str
+
+
+class UnrevokeKeyRequest(BaseModel):
     license_key: str
 
 
@@ -281,7 +343,6 @@ def generate_key(
 
     license_key = generate_license_key()
 
-    # Make absolutely sure the key is unique
     while True:
 
         cursor.execute(
@@ -311,16 +372,18 @@ def generate_key(
             duration_type,
             duration_amount,
             activated,
-            created_at
+            created_at,
+            revoked
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             license_key,
             duration_type,
             request.duration_amount,
             0,
-            created_at
+            created_at,
+            0
         )
     )
 
@@ -332,19 +395,14 @@ def generate_key(
         "license_key": license_key,
         "duration_type": duration_type,
         "duration_amount": request.duration_amount,
-        "activated": False
+        "activated": False,
+        "revoked": False,
+        "status": "not_activated"
     }
 
 
 # ============================================================
 # USER: ACTIVATE KEY
-#
-# First activation:
-# - Saves that computer's HWID
-# - Starts the expiration timer
-#
-# Later activations:
-# - HWID must match
 # ============================================================
 
 @app.post("/api/license/activate")
@@ -404,9 +462,9 @@ def activate_license(
             detail="This license has been revoked."
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # FIRST ACTIVATION
-    # ========================================================
+    # --------------------------------------------------------
 
     if not license_data["activated"]:
 
@@ -461,9 +519,9 @@ def activate_license(
             )
         }
 
-    # ========================================================
-    # ALREADY ACTIVATED: CHECK HWID
-    # ========================================================
+    # --------------------------------------------------------
+    # ALREADY ACTIVATED
+    # --------------------------------------------------------
 
     if license_data["bound_hwid"] != hwid:
 
@@ -481,7 +539,7 @@ def activate_license(
         license_data["expires_at"]
     )
 
-    if now_utc() >= expires_at:
+    if not expires_at or now_utc() >= expires_at:
 
         connection.close()
 
@@ -507,9 +565,6 @@ def activate_license(
 
 # ============================================================
 # USER: VALIDATE LICENSE
-#
-# Your loader can call this periodically.
-# If expired/revoked/wrong HWID, access is denied.
 # ============================================================
 
 @app.post("/api/license/validate")
@@ -573,7 +628,7 @@ def validate_license(
         license_data["expires_at"]
     )
 
-    if now_utc() >= expires_at:
+    if not expires_at or now_utc() >= expires_at:
 
         raise HTTPException(
             status_code=403,
@@ -593,7 +648,88 @@ def validate_license(
 
 
 # ============================================================
-# ADMIN: REVOKE A KEY
+# ADMIN: VIEW ALL KEYS
+# ============================================================
+
+@app.get("/api/admin/licenses")
+def get_all_licenses(
+    x_admin_secret: str = Header(default=None)
+):
+
+    check_admin_secret(x_admin_secret)
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM licenses
+        ORDER BY created_at DESC
+        """
+    )
+
+    license_rows = cursor.fetchall()
+
+    connection.close()
+
+    licenses = [
+        license_to_dict(row)
+        for row in license_rows
+    ]
+
+    return {
+        "success": True,
+        "count": len(licenses),
+        "licenses": licenses
+    }
+
+
+# ============================================================
+# ADMIN: VIEW ONE KEY
+# ============================================================
+
+@app.get("/api/admin/license/{license_key}")
+def get_license(
+    license_key: str,
+    x_admin_secret: str = Header(default=None)
+):
+
+    check_admin_secret(x_admin_secret)
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM licenses
+        WHERE license_key = ?
+        """,
+        (license_key.strip().upper(),)
+    )
+
+    license_data = cursor.fetchone()
+
+    connection.close()
+
+    if not license_data:
+
+        raise HTTPException(
+            status_code=404,
+            detail="License key not found."
+        )
+
+    return {
+        "success": True,
+        "license": license_to_dict(
+            license_data
+        )
+    }
+
+
+# ============================================================
+# ADMIN: REVOKE KEY
 # ============================================================
 
 @app.post("/api/admin/revoke")
@@ -641,16 +777,74 @@ def revoke_key(
 
 
 # ============================================================
-# ADMIN: VIEW A KEY
+# ADMIN: UNREVOKE KEY
 # ============================================================
 
-@app.get("/api/admin/license/{license_key}")
-def get_license(
-    license_key: str,
+@app.post("/api/admin/unrevoke")
+def unrevoke_key(
+    request: UnrevokeKeyRequest,
     x_admin_secret: str = Header(default=None)
 ):
 
     check_admin_secret(x_admin_secret)
+
+    license_key = (
+        request.license_key
+        .strip()
+        .upper()
+    )
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        UPDATE licenses
+        SET revoked = 0
+        WHERE license_key = ?
+        """,
+        (license_key,)
+    )
+
+    if cursor.rowcount == 0:
+
+        connection.close()
+
+        raise HTTPException(
+            status_code=404,
+            detail="License key not found."
+        )
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "message": "License restored."
+    }
+
+
+# ============================================================
+# ADMIN: RESET HWID
+#
+# This does NOT add more time.
+# It only unbinds the current computer.
+# The next activation will bind a new HWID.
+# ============================================================
+
+@app.post("/api/admin/reset-hwid")
+def reset_hwid(
+    request: ResetHWIDRequest,
+    x_admin_secret: str = Header(default=None)
+):
+
+    check_admin_secret(x_admin_secret)
+
+    license_key = (
+        request.license_key
+        .strip()
+        .upper()
+    )
 
     connection = get_connection()
     cursor = connection.cursor()
@@ -661,21 +855,107 @@ def get_license(
         FROM licenses
         WHERE license_key = ?
         """,
-        (license_key.strip().upper(),)
+        (license_key,)
     )
 
     license_data = cursor.fetchone()
 
-    connection.close()
-
     if not license_data:
+
+        connection.close()
 
         raise HTTPException(
             status_code=404,
             detail="License key not found."
         )
 
+    if license_data["revoked"]:
+
+        connection.close()
+
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Cannot reset HWID while this "
+                "license is revoked."
+            )
+        )
+
+    # Preserve the original expiration time.
+    # Only remove the HWID binding.
+    cursor.execute(
+        """
+        UPDATE licenses
+        SET bound_hwid = NULL
+        WHERE license_key = ?
+        """,
+        (license_key,)
+    )
+
+    connection.commit()
+    connection.close()
+
     return {
         "success": True,
-        "license": dict(license_data)
+        "message": (
+            "HWID reset successfully. The license "
+            "can now be used from a new computer."
+        )
+    }
+
+
+# ============================================================
+# ADMIN: SERVER STATS
+# ============================================================
+
+@app.get("/api/admin/stats")
+def get_stats(
+    x_admin_secret: str = Header(default=None)
+):
+
+    check_admin_secret(x_admin_secret)
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM licenses"
+    )
+    total = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM licenses
+        WHERE activated = 1
+        """
+    )
+    activated = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM licenses
+        WHERE activated = 0
+        """
+    )
+    not_activated = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM licenses
+        WHERE revoked = 1
+        """
+    )
+    revoked = cursor.fetchone()[0]
+
+    connection.close()
+
+    return {
+        "success": True,
+        "total_keys": total,
+        "activated_keys": activated,
+        "not_activated_keys": not_activated,
+        "revoked_keys": revoked
     }
