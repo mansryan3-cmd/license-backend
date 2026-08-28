@@ -1,3 +1,4 @@
+
 import os
 import sqlite3
 import secrets
@@ -5,6 +6,7 @@ import string
 import calendar
 import hashlib
 import hmac
+import time
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,20 +19,22 @@ from pydantic import BaseModel
 # CONFIG
 # ============================================================
 
-APP_NAME = "SecureApp License Server"
+APP_NAME = "Resource Hub License Server"
+
+DATABASE_PATH = Path(
+    os.getenv("DATABASE_PATH", "licenses.db")
+)
 
 ADMIN_SECRET = os.getenv(
     "ADMIN_SECRET",
-    "CHANGE_THIS_ADMIN_SECRET"
+    ""
 )
-
-DATABASE_PATH = Path("licenses.db")
 
 SESSION_DAYS = 30
 
 app = FastAPI(
     title=APP_NAME,
-    version="3.0.0"
+    version="4.0.0"
 )
 
 
@@ -39,46 +43,16 @@ app = FastAPI(
 # ============================================================
 
 def get_connection():
-
     connection = sqlite3.connect(
         DATABASE_PATH
     )
-
     connection.row_factory = sqlite3.Row
-
     return connection
 
 
 def setup_database():
-
     connection = get_connection()
     cursor = connection.cursor()
-
-    # --------------------------------------------------------
-    # LICENSES
-    # --------------------------------------------------------
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            license_key TEXT PRIMARY KEY,
-            duration_type TEXT NOT NULL,
-            duration_amount INTEGER NOT NULL,
-
-            activated INTEGER NOT NULL DEFAULT 0,
-            bound_hwid TEXT,
-            activated_at TEXT,
-            expires_at TEXT,
-
-            created_at TEXT NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0,
-
-            owner_username TEXT
-        )
-    """)
-
-    # --------------------------------------------------------
-    # USERS
-    # --------------------------------------------------------
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -90,10 +64,6 @@ def setup_database():
         )
     """)
 
-    # --------------------------------------------------------
-    # SESSIONS
-    # --------------------------------------------------------
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY,
@@ -103,75 +73,59 @@ def setup_database():
         )
     """)
 
-    # Migration for an older licenses.db
-    columns = [
-        row["name"]
-        for row in cursor.execute(
-            "PRAGMA table_info(licenses)"
-        ).fetchall()
-    ]
-
-    if "owner_username" not in columns:
-
-        cursor.execute(
-            """
-            ALTER TABLE licenses
-            ADD COLUMN owner_username TEXT
-            """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            license_key TEXT PRIMARY KEY,
+            duration_type TEXT NOT NULL,
+            duration_amount INTEGER NOT NULL,
+            activated INTEGER NOT NULL DEFAULT 0,
+            bound_hwid TEXT,
+            activated_at TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            owner_username TEXT
         )
+    """)
 
     connection.commit()
     connection.close()
 
 
 @app.on_event("startup")
-def startup_event():
-
+def startup():
     setup_database()
 
 
 # ============================================================
-# TIME HELPERS
+# TIME
 # ============================================================
 
 def now_utc():
-
-    return datetime.now(
-        timezone.utc
-    )
+    return datetime.now(timezone.utc)
 
 
-def datetime_to_string(value):
-
+def iso(value):
     return value.isoformat()
 
 
-def string_to_datetime(value):
-
+def parse_datetime(value):
     if not value:
         return None
-
-    return datetime.fromisoformat(
-        value
-    )
+    return datetime.fromisoformat(value)
 
 
-def get_time_remaining(expires_at):
-
+def seconds_remaining(expires_at):
     if not expires_at:
         return 0
 
     remaining = int(
         (
-            expires_at -
-            now_utc()
+            expires_at - now_utc()
         ).total_seconds()
     )
 
-    return max(
-        0,
-        remaining
-    )
+    return max(0, remaining)
 
 
 # ============================================================
@@ -179,17 +133,10 @@ def get_time_remaining(expires_at):
 # ============================================================
 
 def hash_password(password, salt=None):
-
     if salt is None:
+        salt = secrets.token_bytes(16).hex()
 
-        salt_bytes = secrets.token_bytes(16)
-        salt = salt_bytes.hex()
-
-    else:
-
-        salt_bytes = bytes.fromhex(
-            salt
-        )
+    salt_bytes = bytes.fromhex(salt)
 
     password_hash = hashlib.pbkdf2_hmac(
         "sha256",
@@ -198,10 +145,7 @@ def hash_password(password, salt=None):
         200_000
     )
 
-    return (
-        password_hash.hex(),
-        salt
-    )
+    return password_hash.hex(), salt
 
 
 def verify_password(
@@ -209,7 +153,6 @@ def verify_password(
     stored_hash,
     salt
 ):
-
     calculated_hash, _ = hash_password(
         password,
         salt
@@ -222,24 +165,19 @@ def verify_password(
 
 
 # ============================================================
-# SESSION HANDLING
+# SESSION TOKENS
 # ============================================================
 
 def create_session(username):
-
-    raw_token = secrets.token_urlsafe(
-        48
-    )
+    raw_token = secrets.token_urlsafe(48)
 
     token_hash = hashlib.sha256(
         raw_token.encode("utf-8")
     ).hexdigest()
 
-    created_at = now_utc()
-
-    expires_at = (
-        created_at +
-        timedelta(days=SESSION_DAYS)
+    created = now_utc()
+    expires = created + timedelta(
+        days=SESSION_DAYS
     )
 
     connection = get_connection()
@@ -258,12 +196,8 @@ def create_session(username):
         (
             token_hash,
             username,
-            datetime_to_string(
-                created_at
-            ),
-            datetime_to_string(
-                expires_at
-            )
+            iso(created),
+            iso(expires)
         )
     )
 
@@ -273,8 +207,7 @@ def create_session(username):
     return raw_token
 
 
-def get_username_from_token(token):
-
+def session_username(token):
     if not token:
         return None
 
@@ -287,26 +220,24 @@ def get_username_from_token(token):
 
     cursor.execute(
         """
-        SELECT *
+        SELECT username, expires_at
         FROM sessions
         WHERE token_hash = ?
         """,
         (token_hash,)
     )
 
-    session = cursor.fetchone()
+    row = cursor.fetchone()
 
-    if not session:
-
+    if not row:
         connection.close()
         return None
 
-    expires_at = string_to_datetime(
-        session["expires_at"]
+    expires_at = parse_datetime(
+        row["expires_at"]
     )
 
     if not expires_at or now_utc() >= expires_at:
-
         cursor.execute(
             """
             DELETE FROM sessions
@@ -314,47 +245,15 @@ def get_username_from_token(token):
             """,
             (token_hash,)
         )
-
         connection.commit()
         connection.close()
-
         return None
 
     connection.close()
-
-    return session["username"]
-
-
-def get_user_from_token(token):
-
-    username = get_username_from_token(
-        token
-    )
-
-    if not username:
-        return None
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE username = ?
-        """,
-        (username,)
-    )
-
-    user = cursor.fetchone()
-
-    connection.close()
-
-    return user
+    return row["username"]
 
 
-def remove_session(token):
-
+def delete_session(token):
     if not token:
         return
 
@@ -377,38 +276,26 @@ def remove_session(token):
     connection.close()
 
 
-def require_user(
-    authorization: str = Header(default=None)
+def auth_username(
+    authorization: str | None
 ):
-
     if not authorization:
-
         raise HTTPException(
             status_code=401,
             detail="Login required."
         )
 
-    if authorization.startswith(
-        "Bearer "
-    ):
+    token = authorization
 
-        token = authorization[
-            7:
-        ].strip()
+    if token.startswith("Bearer "):
+        token = token[7:].strip()
 
-    else:
-
-        token = authorization.strip()
-
-    username = get_username_from_token(
-        token
-    )
+    username = session_username(token)
 
     if not username:
-
         raise HTTPException(
             status_code=401,
-            detail="Session expired. Please login again."
+            detail="Session expired. Please sign in again."
         )
 
     return username
@@ -418,22 +305,25 @@ def require_user(
 # ADMIN AUTH
 # ============================================================
 
-def check_admin_secret(
-    x_admin_secret
+def require_admin(
+    x_admin_secret: str | None
 ):
+    if not ADMIN_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_SECRET is not configured on the server."
+        )
 
     if not x_admin_secret:
-
         raise HTTPException(
             status_code=401,
-            detail="Missing admin authorization."
+            detail="Admin authorization required."
         )
 
     if not hmac.compare_digest(
         x_admin_secret,
         ADMIN_SECRET
     ):
-
         raise HTTPException(
             status_code=403,
             detail="Invalid admin authorization."
@@ -441,45 +331,27 @@ def check_admin_secret(
 
 
 # ============================================================
-# KEY GENERATION
+# LICENSE HELPERS
 # ============================================================
 
 def generate_license_key():
-
     characters = (
-        string.ascii_uppercase +
-        string.digits
+        string.ascii_uppercase
+        + string.digits
     )
 
-    characters = characters.replace(
-        "O",
-        ""
-    )
-
-    characters = characters.replace(
-        "I",
-        ""
-    )
-
-    characters = characters.replace(
-        "0",
-        ""
-    )
-
-    characters = characters.replace(
-        "1",
-        ""
-    )
+    for char in "O01I":
+        characters = characters.replace(
+            char,
+            ""
+        )
 
     groups = []
 
     for _ in range(4):
-
         groups.append(
             "".join(
-                secrets.choice(
-                    characters
-                )
+                secrets.choice(characters)
                 for _ in range(5)
             )
         )
@@ -487,36 +359,30 @@ def generate_license_key():
     return "-".join(groups)
 
 
-def add_months(
-    start_date,
-    months
-):
-
-    month = (
-        start_date.month -
-        1 +
-        months
+def add_months(start, months):
+    month_index = (
+        start.month - 1 + months
     )
 
     year = (
-        start_date.year +
-        month // 12
+        start.year
+        + month_index // 12
     )
 
     month = (
-        month % 12 +
-        1
+        month_index % 12
+        + 1
     )
 
     day = min(
-        start_date.day,
+        start.day,
         calendar.monthrange(
             year,
             month
         )[1]
     )
 
-    return start_date.replace(
+    return start.replace(
         year=year,
         month=month,
         day=day
@@ -527,8 +393,7 @@ def calculate_expiration(
     duration_type,
     duration_amount
 ):
-
-    current_time = now_utc()
+    start = now_utc()
 
     duration_type = (
         duration_type
@@ -537,36 +402,23 @@ def calculate_expiration(
     )
 
     if duration_type == "minutes":
-
-        return (
-            current_time +
-            timedelta(
-                minutes=duration_amount
-            )
+        return start + timedelta(
+            minutes=duration_amount
         )
 
     if duration_type == "hours":
-
-        return (
-            current_time +
-            timedelta(
-                hours=duration_amount
-            )
+        return start + timedelta(
+            hours=duration_amount
         )
 
     if duration_type == "days":
-
-        return (
-            current_time +
-            timedelta(
-                days=duration_amount
-            )
+        return start + timedelta(
+            days=duration_amount
         )
 
     if duration_type == "months":
-
         return add_months(
-            current_time,
+            start,
             duration_amount
         )
 
@@ -575,135 +427,99 @@ def calculate_expiration(
     )
 
 
+def license_status(row):
+    if row["revoked"]:
+        return "revoked"
+
+    if not row["activated"]:
+        return "not_activated"
+
+    expires_at = parse_datetime(
+        row["expires_at"]
+    )
+
+    if not expires_at or now_utc() >= expires_at:
+        return "expired"
+
+    return "active"
+
+
 # ============================================================
 # REQUEST MODELS
 # ============================================================
 
 class RegisterRequest(BaseModel):
-
     username: str
     password: str
 
 
 class LoginRequest(BaseModel):
-
     username: str
     password: str
 
 
-class GenerateKeyRequest(BaseModel):
-
+class GenerateRequest(BaseModel):
     duration_type: str
     duration_amount: int
 
 
-class ActivateKeyRequest(BaseModel):
-
+class LicenseRequest(BaseModel):
     license_key: str
     hwid: str
 
 
-class ValidateKeyRequest(BaseModel):
-
-    license_key: str
-    hwid: str
-
-
-class RevokeKeyRequest(BaseModel):
-
-    license_key: str
-
-
-class ResetHWIDRequest(BaseModel):
-
-    license_key: str
-
-
-class UnrevokeKeyRequest(BaseModel):
-
+class AdminLicenseRequest(BaseModel):
     license_key: str
 
 
 # ============================================================
-# SERVER TEST
+# BASIC
 # ============================================================
 
 @app.get("/")
 def root():
-
     return {
         "success": True,
-        "message": (
-            "SecureApp license server is online."
-        ),
-        "version": "3.0.0",
-        "server_time":
-            datetime_to_string(
-                now_utc()
-            )
+        "message": "Resource Hub license server is online.",
+        "version": "4.0.0",
+        "server_time": iso(now_utc())
     }
 
 
 @app.get("/health")
 def health():
-
     return {
         "success": True,
-        "status": "online"
+        "status": "online",
+        "server_time": iso(now_utc())
     }
 
 
 # ============================================================
-# REGISTER
+# AUTH
 # ============================================================
 
 @app.post("/api/auth/register")
-def register(
-    request: RegisterRequest
-):
-
+def register(request: RegisterRequest):
     username = request.username.strip()
-
     password = request.password
 
-    if len(username) < 3:
-
+    if len(username) < 3 or len(username) > 32:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Username must be at least 3 characters."
-            )
+            detail="Username must be 3-32 characters."
         )
 
-    if len(username) > 32:
-
+    if not username.replace("_", "").isalnum():
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Username must be 32 characters or less."
-            )
-        )
-
-    if not username.replace(
-        "_",
-        ""
-    ).isalnum():
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Username may only contain "
-                "letters, numbers, and underscores."
-            )
+            detail="Username may contain only letters, numbers, and underscores."
         )
 
     if len(password) < 6:
-
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Password must be at least 6 characters."
-            )
+            detail="Password must be at least 6 characters."
         )
 
     password_hash, salt = hash_password(
@@ -723,9 +539,7 @@ def register(
     )
 
     if cursor.fetchone():
-
         connection.close()
-
         raise HTTPException(
             status_code=409,
             detail="Username already exists."
@@ -745,9 +559,7 @@ def register(
             username,
             password_hash,
             salt,
-            datetime_to_string(
-                now_utc()
-            )
+            iso(now_utc())
         )
     )
 
@@ -760,21 +572,13 @@ def register(
 
     return {
         "success": True,
-        "message": "Account created successfully.",
         "username": username,
         "token": token
     }
 
 
-# ============================================================
-# LOGIN
-# ============================================================
-
 @app.post("/api/auth/login")
-def login(
-    request: LoginRequest
-):
-
+def login(request: LoginRequest):
     username = request.username.strip()
 
     connection = get_connection()
@@ -790,24 +594,19 @@ def login(
     )
 
     user = cursor.fetchone()
-
     connection.close()
 
     if not user:
-
         raise HTTPException(
             status_code=401,
             detail="Invalid username or password."
         )
 
-    valid = verify_password(
+    if not verify_password(
         request.password,
         user["password_hash"],
         user["salt"]
-    )
-
-    if not valid:
-
+    ):
         raise HTTPException(
             status_code=401,
             detail="Invalid username or password."
@@ -819,49 +618,31 @@ def login(
 
     return {
         "success": True,
-        "message": "Login successful.",
         "username": username,
         "token": token
     }
 
 
-# ============================================================
-# LOGOUT
-# ============================================================
-
 @app.post("/api/auth/logout")
 def logout(
-    authorization: str = Header(default=None)
+    authorization: str | None = Header(default=None)
 ):
-
     if authorization:
-
-        if authorization.startswith(
-            "Bearer "
-        ):
-            token = authorization[7:].strip()
-
-        else:
-            token = authorization.strip()
-
-        remove_session(token)
+        token = authorization
+        if token.startswith("Bearer "):
+            token = token[7:].strip()
+        delete_session(token)
 
     return {
-        "success": True,
-        "message": "Logged out."
+        "success": True
     }
 
 
-# ============================================================
-# CURRENT ACCOUNT
-# ============================================================
-
 @app.get("/api/auth/me")
-def current_account(
-    authorization: str = Header(default=None)
+def me(
+    authorization: str | None = Header(default=None)
 ):
-
-    username = require_user(
+    username = auth_username(
         authorization
     )
 
@@ -890,45 +671,260 @@ def current_account(
         (username,)
     )
 
-    license_data = cursor.fetchone()
+    license_row = cursor.fetchone()
 
     connection.close()
 
-    result = {
+    account = {
         "username": user["username"],
         "created_at": user["created_at"],
         "license": None
     }
 
-    if license_data:
-
-        expires_at = string_to_datetime(
-            license_data["expires_at"]
+    if license_row:
+        expires_at = parse_datetime(
+            license_row["expires_at"]
         )
 
-        result["license"] = {
-            "license_key":
-                license_data["license_key"],
-            "status":
-                "revoked"
-                if license_data["revoked"]
-                else (
-                    "expired"
-                    if expires_at
-                    and now_utc() >= expires_at
-                    else "active"
-                ),
-            "expires_at":
-                license_data["expires_at"],
-            "seconds_remaining":
-                get_time_remaining(
-                    expires_at
-                )
+        account["license"] = {
+            "license_key": license_row["license_key"],
+            "status": license_status(license_row),
+            "expires_at": license_row["expires_at"],
+            "seconds_remaining": seconds_remaining(
+                expires_at
+            )
         }
 
     return {
         "success": True,
-        "account": result
+        "account": account
+    }
+
+
+# ============================================================
+# USER LICENSE ACTIVATION
+# ============================================================
+
+@app.post("/api/license/activate")
+def activate(
+    request: LicenseRequest,
+    authorization: str | None = Header(default=None)
+):
+    username = auth_username(
+        authorization
+    )
+
+    key = (
+        request.license_key
+        .strip()
+        .upper()
+    )
+
+    hwid = request.hwid.strip()
+
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="License key is required."
+        )
+
+    if not hwid:
+        raise HTTPException(
+            status_code=400,
+            detail="Device information is required."
+        )
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM licenses
+        WHERE license_key = ?
+        """,
+        (key,)
+    )
+
+    row = cursor.fetchone()
+
+    if not row:
+        connection.close()
+        raise HTTPException(
+            status_code=404,
+            detail="Invalid license key."
+        )
+
+    if row["revoked"]:
+        connection.close()
+        raise HTTPException(
+            status_code=403,
+            detail="This license has been revoked."
+        )
+
+    # First activation.
+    if not row["activated"]:
+
+        expiration = calculate_expiration(
+            row["duration_type"],
+            row["duration_amount"]
+        )
+
+        activated_at = now_utc()
+
+        cursor.execute(
+            """
+            UPDATE licenses
+            SET
+                activated = 1,
+                bound_hwid = ?,
+                activated_at = ?,
+                expires_at = ?,
+                owner_username = ?
+            WHERE license_key = ?
+            """,
+            (
+                hwid,
+                iso(activated_at),
+                iso(expiration),
+                username,
+                key
+            )
+        )
+
+        connection.commit()
+        connection.close()
+
+        return {
+            "success": True,
+            "message": "License activated successfully.",
+            "seconds_remaining":
+                seconds_remaining(expiration),
+            "expires_at": iso(expiration)
+        }
+
+    # Already active: enforce the original account/device.
+    if row["bound_hwid"] != hwid:
+        connection.close()
+        raise HTTPException(
+            status_code=403,
+            detail="HWID mismatch. This license is already bound to another device."
+        )
+
+    if (
+        row["owner_username"]
+        and row["owner_username"] != username
+    ):
+        connection.close()
+        raise HTTPException(
+            status_code=403,
+            detail="This license belongs to another account."
+        )
+
+    expiration = parse_datetime(
+        row["expires_at"]
+    )
+
+    if not expiration or now_utc() >= expiration:
+        connection.close()
+        raise HTTPException(
+            status_code=403,
+            detail="This license has expired."
+        )
+
+    connection.close()
+
+    return {
+        "success": True,
+        "message": "License is valid.",
+        "seconds_remaining":
+            seconds_remaining(expiration),
+        "expires_at": iso(expiration)
+    }
+
+
+@app.post("/api/license/validate")
+def validate(
+    request: LicenseRequest,
+    authorization: str | None = Header(default=None)
+):
+    username = auth_username(
+        authorization
+    )
+
+    key = (
+        request.license_key
+        .strip()
+        .upper()
+    )
+
+    hwid = request.hwid.strip()
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM licenses
+        WHERE license_key = ?
+        """,
+        (key,)
+    )
+
+    row = cursor.fetchone()
+    connection.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Invalid license key."
+        )
+
+    if row["revoked"]:
+        raise HTTPException(
+            status_code=403,
+            detail="This license has been revoked."
+        )
+
+    if not row["activated"]:
+        raise HTTPException(
+            status_code=403,
+            detail="This license has not been activated."
+        )
+
+    if row["bound_hwid"] != hwid:
+        raise HTTPException(
+            status_code=403,
+            detail="HWID mismatch."
+        )
+
+    if (
+        row["owner_username"]
+        and row["owner_username"] != username
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="This license belongs to another account."
+        )
+
+    expiration = parse_datetime(
+        row["expires_at"]
+    )
+
+    if not expiration or now_utc() >= expiration:
+        raise HTTPException(
+            status_code=403,
+            detail="This license has expired."
+        )
+
+    return {
+        "success": True,
+        "valid": True,
+        "seconds_remaining":
+            seconds_remaining(expiration),
+        "expires_at": iso(expiration),
+        "username": username
     }
 
 
@@ -938,11 +934,10 @@ def current_account(
 
 @app.post("/api/admin/generate")
 def admin_generate(
-    request: GenerateKeyRequest,
-    x_admin_secret: str = Header(default=None)
+    request: GenerateRequest,
+    x_admin_secret: str | None = Header(default=None)
 ):
-
-    check_admin_secret(
+    require_admin(
         x_admin_secret
     )
 
@@ -952,34 +947,28 @@ def admin_generate(
         .lower()
     )
 
-    if duration_type not in [
+    if duration_type not in {
         "minutes",
         "hours",
         "days",
         "months"
-    ]:
-
+    }:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Duration type must be Minutes, "
-                "Hours, Days, or Months."
-            )
+            detail="Invalid duration type."
         )
 
     if request.duration_amount < 1:
-
         raise HTTPException(
             status_code=400,
-            detail="Duration amount must be at least 1."
+            detail="Amount must be at least 1."
         )
 
     connection = get_connection()
     cursor = connection.cursor()
 
     while True:
-
-        license_key = generate_license_key()
+        key = generate_license_key()
 
         cursor.execute(
             """
@@ -987,7 +976,7 @@ def admin_generate(
             FROM licenses
             WHERE license_key = ?
             """,
-            (license_key,)
+            (key,)
         )
 
         if not cursor.fetchone():
@@ -1007,12 +996,10 @@ def admin_generate(
         VALUES (?, ?, ?, 0, ?, 0, NULL)
         """,
         (
-            license_key,
+            key,
             duration_type,
             request.duration_amount,
-            datetime_to_string(
-                now_utc()
-            )
+            iso(now_utc())
         )
     )
 
@@ -1021,325 +1008,22 @@ def admin_generate(
 
     return {
         "success": True,
-        "license_key": license_key,
+        "license_key": key,
         "duration_type": duration_type,
-        "duration_amount":
-            request.duration_amount,
+        "duration_amount": request.duration_amount,
         "activated": False
     }
 
 
 # ============================================================
-# USER: ACTIVATE LICENSE
-# ============================================================
-
-@app.post("/api/license/activate")
-def activate_license(
-    request: ActivateKeyRequest,
-    authorization: str = Header(default=None)
-):
-
-    username = require_user(
-        authorization
-    )
-
-    license_key = (
-        request.license_key
-        .strip()
-        .upper()
-    )
-
-    hwid = request.hwid.strip()
-
-    if not license_key:
-
-        raise HTTPException(
-            status_code=400,
-            detail="License key is required."
-        )
-
-    if not hwid:
-
-        raise HTTPException(
-            status_code=400,
-            detail="HWID is required."
-        )
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT *
-        FROM licenses
-        WHERE license_key = ?
-        """,
-        (license_key,)
-    )
-
-    license_data = cursor.fetchone()
-
-    if not license_data:
-
-        connection.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Invalid license key."
-        )
-
-    if license_data["revoked"]:
-
-        connection.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail="This license has been revoked."
-        )
-
-    # --------------------------------------------------------
-    # FIRST ACTIVATION
-    # --------------------------------------------------------
-
-    if not license_data["activated"]:
-
-        try:
-
-            expires_at = calculate_expiration(
-                license_data["duration_type"],
-                license_data["duration_amount"]
-            )
-
-        except ValueError:
-
-            connection.close()
-
-            raise HTTPException(
-                status_code=500,
-                detail="Invalid license duration."
-            )
-
-        activated_at = now_utc()
-
-        cursor.execute(
-            """
-            UPDATE licenses
-            SET
-                activated = 1,
-                bound_hwid = ?,
-                activated_at = ?,
-                expires_at = ?,
-                owner_username = ?
-            WHERE license_key = ?
-            """,
-            (
-                hwid,
-                datetime_to_string(
-                    activated_at
-                ),
-                datetime_to_string(
-                    expires_at
-                ),
-                username,
-                license_key
-            )
-        )
-
-        connection.commit()
-        connection.close()
-
-        return {
-            "success": True,
-            "message": (
-                "License activated successfully."
-            ),
-            "username": username,
-            "first_activation": True,
-            "expires_at":
-                datetime_to_string(
-                    expires_at
-                ),
-            "seconds_remaining":
-                get_time_remaining(
-                    expires_at
-                )
-        }
-
-    # --------------------------------------------------------
-    # ALREADY ACTIVATED
-    # --------------------------------------------------------
-
-    if license_data["bound_hwid"] != hwid:
-
-        connection.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "HWID mismatch. This license is "
-                "already activated on another device."
-            )
-        )
-
-    if (
-        license_data["owner_username"]
-        and
-        license_data["owner_username"] != username
-    ):
-
-        connection.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This license belongs to another account."
-            )
-        )
-
-    expires_at = string_to_datetime(
-        license_data["expires_at"]
-    )
-
-    if not expires_at or now_utc() >= expires_at:
-
-        connection.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail="This license has expired."
-        )
-
-    connection.close()
-
-    return {
-        "success": True,
-        "message": "License is valid.",
-        "username": username,
-        "first_activation": False,
-        "expires_at":
-            datetime_to_string(
-                expires_at
-            ),
-        "seconds_remaining":
-            get_time_remaining(
-                expires_at
-            )
-    }
-
-
-# ============================================================
-# USER: VALIDATE LICENSE
-# ============================================================
-
-@app.post("/api/license/validate")
-def validate_license(
-    request: ValidateKeyRequest,
-    authorization: str = Header(default=None)
-):
-
-    username = require_user(
-        authorization
-    )
-
-    license_key = (
-        request.license_key
-        .strip()
-        .upper()
-    )
-
-    hwid = request.hwid.strip()
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT *
-        FROM licenses
-        WHERE license_key = ?
-        """,
-        (license_key,)
-    )
-
-    license_data = cursor.fetchone()
-
-    connection.close()
-
-    if not license_data:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Invalid license key."
-        )
-
-    if license_data["revoked"]:
-
-        raise HTTPException(
-            status_code=403,
-            detail="This license has been revoked."
-        )
-
-    if not license_data["activated"]:
-
-        raise HTTPException(
-            status_code=403,
-            detail="This license has not been activated."
-        )
-
-    if license_data["bound_hwid"] != hwid:
-
-        raise HTTPException(
-            status_code=403,
-            detail="HWID mismatch."
-        )
-
-    owner = license_data[
-        "owner_username"
-    ]
-
-    if owner and owner != username:
-
-        raise HTTPException(
-            status_code=403,
-            detail="This license belongs to another account."
-        )
-
-    expires_at = string_to_datetime(
-        license_data["expires_at"]
-    )
-
-    if not expires_at or now_utc() >= expires_at:
-
-        raise HTTPException(
-            status_code=403,
-            detail="This license has expired."
-        )
-
-    return {
-        "success": True,
-        "valid": True,
-        "username": username,
-        "expires_at":
-            datetime_to_string(
-                expires_at
-            ),
-        "seconds_remaining":
-            get_time_remaining(
-                expires_at
-            )
-    }
-
-
-# ============================================================
-# ADMIN: ALL LICENSES
+# ADMIN: LIST
 # ============================================================
 
 @app.get("/api/admin/licenses")
-def admin_all_licenses(
-    x_admin_secret: str = Header(default=None)
+def admin_list(
+    x_admin_secret: str | None = Header(default=None)
 ):
-
-    check_admin_secret(
+    require_admin(
         x_admin_secret
     )
 
@@ -1355,80 +1039,61 @@ def admin_all_licenses(
     )
 
     rows = cursor.fetchall()
-
     connection.close()
 
-    results = []
+    licenses = []
 
     for row in rows:
 
         data = dict(row)
 
-        expires_at = string_to_datetime(
-            data.get("expires_at")
+        status = license_status(
+            row
         )
 
-        if data["revoked"]:
-
-            status = "revoked"
-
-        elif not data["activated"]:
-
-            status = "not_activated"
-
-        elif (
-            expires_at
-            and
-            now_utc() >= expires_at
-        ):
-
-            status = "expired"
-
-        else:
-
-            status = "active"
+        expiration = parse_datetime(
+            row["expires_at"]
+        )
 
         data["status"] = status
-
         data["seconds_remaining"] = (
-            get_time_remaining(
-                expires_at
-            )
-            if expires_at
+            seconds_remaining(expiration)
+            if expiration
             else 0
         )
 
         data["activated"] = bool(
-            data["activated"]
+            row["activated"]
         )
 
         data["revoked"] = bool(
-            data["revoked"]
+            row["revoked"]
         )
 
-        results.append(
+        licenses.append(
             data
         )
 
     return {
         "success": True,
-        "count": len(results),
-        "licenses": results
+        "count": len(licenses),
+        "licenses": licenses
     }
 
 
-# ============================================================
-# ADMIN: ONE LICENSE
-# ============================================================
-
 @app.get("/api/admin/license/{license_key}")
-def admin_one_license(
+def admin_one(
     license_key: str,
-    x_admin_secret: str = Header(default=None)
+    x_admin_secret: str | None = Header(default=None)
 ):
-
-    check_admin_secret(
+    require_admin(
         x_admin_secret
+    )
+
+    key = (
+        license_key
+        .strip()
+        .upper()
     )
 
     connection = get_connection()
@@ -1440,66 +1105,40 @@ def admin_one_license(
         FROM licenses
         WHERE license_key = ?
         """,
-        (
-            license_key
-            .strip()
-            .upper(),
-        )
+        (key,)
     )
 
     row = cursor.fetchone()
-
     connection.close()
 
     if not row:
-
         raise HTTPException(
             status_code=404,
-            detail="License key not found."
+            detail="License not found."
         )
 
     data = dict(row)
 
-    expires_at = string_to_datetime(
-        data.get("expires_at")
+    expiration = parse_datetime(
+        row["expires_at"]
     )
 
-    if data["revoked"]:
-
-        status = "revoked"
-
-    elif not data["activated"]:
-
-        status = "not_activated"
-
-    elif (
-        expires_at
-        and
-        now_utc() >= expires_at
-    ):
-
-        status = "expired"
-
-    else:
-
-        status = "active"
-
-    data["status"] = status
+    data["status"] = license_status(
+        row
+    )
 
     data["seconds_remaining"] = (
-        get_time_remaining(
-            expires_at
-        )
-        if expires_at
+        seconds_remaining(expiration)
+        if expiration
         else 0
     )
 
     data["activated"] = bool(
-        data["activated"]
+        row["activated"]
     )
 
     data["revoked"] = bool(
-        data["revoked"]
+        row["revoked"]
     )
 
     return {
@@ -1509,16 +1148,15 @@ def admin_one_license(
 
 
 # ============================================================
-# ADMIN: REVOKE
+# ADMIN: REVOKE / RESTORE / HWID RESET
 # ============================================================
 
 @app.post("/api/admin/revoke")
 def admin_revoke(
-    request: RevokeKeyRequest,
-    x_admin_secret: str = Header(default=None)
+    request: AdminLicenseRequest,
+    x_admin_secret: str | None = Header(default=None)
 ):
-
-    check_admin_secret(
+    require_admin(
         x_admin_secret
     )
 
@@ -1541,12 +1179,10 @@ def admin_revoke(
     )
 
     if cursor.rowcount == 0:
-
         connection.close()
-
         raise HTTPException(
             status_code=404,
-            detail="License key not found."
+            detail="License not found."
         )
 
     connection.commit()
@@ -1558,17 +1194,12 @@ def admin_revoke(
     }
 
 
-# ============================================================
-# ADMIN: RESTORE
-# ============================================================
-
 @app.post("/api/admin/unrevoke")
-def admin_unrevoke(
-    request: UnrevokeKeyRequest,
-    x_admin_secret: str = Header(default=None)
+def admin_restore(
+    request: AdminLicenseRequest,
+    x_admin_secret: str | None = Header(default=None)
 ):
-
-    check_admin_secret(
+    require_admin(
         x_admin_secret
     )
 
@@ -1591,12 +1222,10 @@ def admin_unrevoke(
     )
 
     if cursor.rowcount == 0:
-
         connection.close()
-
         raise HTTPException(
             status_code=404,
-            detail="License key not found."
+            detail="License not found."
         )
 
     connection.commit()
@@ -1608,17 +1237,12 @@ def admin_unrevoke(
     }
 
 
-# ============================================================
-# ADMIN: RESET HWID
-# ============================================================
-
 @app.post("/api/admin/reset-hwid")
 def admin_reset_hwid(
-    request: ResetHWIDRequest,
-    x_admin_secret: str = Header(default=None)
+    request: AdminLicenseRequest,
+    x_admin_secret: str | None = Header(default=None)
 ):
-
-    check_admin_secret(
+    require_admin(
         x_admin_secret
     )
 
@@ -1633,47 +1257,31 @@ def admin_reset_hwid(
 
     cursor.execute(
         """
-        SELECT *
-        FROM licenses
-        WHERE license_key = ?
-        """,
-        (key,)
-    )
-
-    license_data = cursor.fetchone()
-
-    if not license_data:
-
-        connection.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="License key not found."
-        )
-
-    cursor.execute(
-        """
         UPDATE licenses
         SET
-            bound_hwid = NULL,
-            owner_username = NULL,
             activated = 0,
+            bound_hwid = NULL,
             activated_at = NULL,
-            expires_at = NULL
+            expires_at = NULL,
+            owner_username = NULL
         WHERE license_key = ?
         """,
         (key,)
     )
+
+    if cursor.rowcount == 0:
+        connection.close()
+        raise HTTPException(
+            status_code=404,
+            detail="License not found."
+        )
 
     connection.commit()
     connection.close()
 
     return {
         "success": True,
-        "message": (
-            "HWID reset. The license is ready "
-            "for a new activation."
-        )
+        "message": "HWID reset successfully."
     }
 
 
@@ -1683,10 +1291,9 @@ def admin_reset_hwid(
 
 @app.get("/api/admin/stats")
 def admin_stats(
-    x_admin_secret: str = Header(default=None)
+    x_admin_secret: str | None = Header(default=None)
 ):
-
-    check_admin_secret(
+    require_admin(
         x_admin_secret
     )
 
@@ -1696,7 +1303,6 @@ def admin_stats(
     cursor.execute(
         "SELECT COUNT(*) FROM licenses"
     )
-
     total = cursor.fetchone()[0]
 
     cursor.execute(
@@ -1707,7 +1313,6 @@ def admin_stats(
         AND revoked = 0
         """
     )
-
     activated = cursor.fetchone()[0]
 
     cursor.execute(
@@ -1717,7 +1322,6 @@ def admin_stats(
         WHERE activated = 0
         """
     )
-
     unused = cursor.fetchone()[0]
 
     cursor.execute(
@@ -1727,13 +1331,11 @@ def admin_stats(
         WHERE revoked = 1
         """
     )
-
     revoked = cursor.fetchone()[0]
 
     cursor.execute(
         "SELECT COUNT(*) FROM users"
     )
-
     users = cursor.fetchone()[0]
 
     connection.close()
