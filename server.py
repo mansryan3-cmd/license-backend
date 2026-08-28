@@ -89,7 +89,9 @@ def setup_database():
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            last_login_at TEXT,
+            last_seen_at TEXT
         )
         """
     )
@@ -101,7 +103,8 @@ def setup_database():
             token_hash TEXT PRIMARY KEY,
             username TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT
         )
         """
     )
@@ -126,6 +129,10 @@ def setup_database():
 
 
     # Migrate older database files safely.
+
+    ensure_column(cursor, "users", "last_login_at", "TEXT")
+    ensure_column(cursor, "users", "last_seen_at", "TEXT")
+    ensure_column(cursor, "sessions", "last_seen_at", "TEXT")
 
     ensure_column(
         cursor,
@@ -304,15 +311,17 @@ def create_session(username):
             token_hash,
             username,
             created_at,
-            expires_at
+            expires_at,
+            last_seen_at
         )
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
         (
             token_hash,
             username,
             iso(created),
-            iso(expires)
+            iso(expires),
+            iso(created)
         )
     )
 
@@ -325,7 +334,7 @@ def create_session(username):
     return token
 
 
-def get_session_user(token):
+def get_session_user(token, touch=True):
 
     if not token:
         return None
@@ -886,6 +895,15 @@ def login(
         )
 
 
+    seen = iso(now_utc())
+    connection = get_connection()
+    connection.execute(
+        "UPDATE users SET last_login_at = ?, last_seen_at = ? WHERE username = ?",
+        (seen, seen, username)
+    )
+    connection.commit()
+    connection.close()
+
     return {
         "success": True,
         "username": username,
@@ -912,6 +930,14 @@ def logout(
     return {
         "success": True
     }
+
+
+@app.post("/api/auth/heartbeat")
+def heartbeat(
+    authorization: str | None = Header(default=None)
+):
+    username = require_user(authorization)
+    return {"success": True, "username": username, "server_time": iso(now_utc())}
 
 
 @app.get("/api/auth/me")
@@ -1405,7 +1431,9 @@ def admin_users(
         SELECT
             id,
             username,
-            created_at
+            created_at,
+            last_login_at,
+            last_seen_at
         FROM users
         ORDER BY created_at DESC
         """
@@ -1438,6 +1466,15 @@ def admin_users(
 
                 "created_at":
                     user["created_at"],
+                "last_login_at":
+                    user["last_login_at"],
+                "last_seen_at":
+                    user["last_seen_at"],
+                "online": bool(
+                    user["last_seen_at"]
+                    and
+                    (now_utc() - parse_datetime(user["last_seen_at"])).total_seconds() <= 90
+                ),
 
                 "license_count":
                     len(licenses),
@@ -1667,6 +1704,29 @@ def admin_reset_hwid(
         "message":
             "HWID reset successfully."
     }
+
+
+@app.get("/api/admin/activity")
+def admin_activity(
+    x_admin_secret: str | None = Header(default=None)
+):
+    require_admin(x_admin_secret)
+    connection = get_connection()
+    rows = connection.execute(
+        """SELECT username, last_login_at, last_seen_at FROM users ORDER BY COALESCE(last_seen_at, last_login_at, created_at) DESC LIMIT 50"""
+    ).fetchall()
+    connection.close()
+    result = []
+    for row in rows:
+        seen = parse_datetime(row["last_seen_at"]) if row["last_seen_at"] else None
+        online = bool(seen and (now_utc() - seen).total_seconds() <= 90)
+        result.append({
+            "username": row["username"],
+            "last_login_at": row["last_login_at"],
+            "last_seen_at": row["last_seen_at"],
+            "online": online
+        })
+    return {"success": True, "users": result}
 
 
 # ============================================================
