@@ -4,7 +4,30 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
-DB = Path(os.getenv("DATABASE_PATH","licenses.db"))
+def choose_database():
+    configured = os.getenv("DATABASE_PATH")
+    if configured:
+        return Path(configured)
+
+    candidates = [
+        Path("/var/data/resourcehub.db"),
+        Path("/var/data/licenses.db"),
+        Path("licenses.db"),
+    ]
+
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            pass
+
+    if Path("/var/data").exists():
+        return Path("/var/data/resourcehub.db")
+
+    return Path("licenses.db")
+
+DB = choose_database()
 APP_ENV = os.getenv("APP_ENV","production")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET","")
 CLIENT_VERSION = os.getenv("CLIENT_VERSION","10.0.0")
@@ -110,6 +133,70 @@ def lic_status(r):
 def lic_dict(r):
     return dict(r) | {"activated":bool(r["activated"]),"revoked":bool(r["revoked"]),"status":lic_status(r),"seconds_remaining":remain(r["expires_at"])}
 
+def reconcile_license_owners(c=None):
+    own_connection = c is None
+    if own_connection:
+        c = conn()
+
+    changed = 0
+    rows = c.execute(
+        "SELECT license_key FROM licenses WHERE owner_username IS NULL OR TRIM(owner_username)=''"
+    ).fetchall()
+
+    for row in rows:
+        hit = c.execute(
+            """
+            SELECT username
+            FROM audit_logs
+            WHERE license_key=?
+              AND action='LICENSE_ACTIVATED'
+              AND username IS NOT NULL
+              AND TRIM(username)!=''
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (row["license_key"],),
+        ).fetchone()
+
+        if hit:
+            c.execute(
+                "UPDATE licenses SET owner_username=? WHERE license_key=?",
+                (hit["username"], row["license_key"]),
+            )
+            changed += 1
+
+    if changed:
+        c.commit()
+
+    if own_connection:
+        c.close()
+
+    return changed
+
+def enriched_license(c, r):
+    data = lic_dict(r)
+    owner = data.get("owner_username")
+
+    data["assigned"] = bool(owner)
+    data["owner_online"] = False
+    data["owner_last_login_at"] = None
+    data["owner_last_seen_at"] = None
+    data["owner_disabled"] = False
+
+    if owner:
+        user = c.execute(
+            "SELECT username,last_login_at,last_seen_at,disabled FROM users WHERE username=?",
+            (owner,),
+        ).fetchone()
+
+        if user:
+            data["owner_online"] = online(user["last_seen_at"])
+            data["owner_last_login_at"] = user["last_login_at"]
+            data["owner_last_seen_at"] = user["last_seen_at"]
+            data["owner_disabled"] = bool(user["disabled"])
+
+    return data
+
 class Auth(BaseModel): username:str; password:str
 class Gen(BaseModel): duration_type:str; duration_amount:int
 class LicenseReq(BaseModel): license_key:str; hwid:str
@@ -212,14 +299,26 @@ def admin_generate(b:Gen,x: str|None=Header(default=None,alias="X-Admin-Secret")
 
 @app.get("/api/admin/licenses")
 def licenses(x:str|None=Header(default=None,alias="X-Admin-Secret")):
-    admin(x); c=conn(); rows=c.execute("SELECT * FROM licenses ORDER BY created_at DESC").fetchall(); c.close()
-    return {"success":True,"count":len(rows),"licenses":[lic_dict(r) for r in rows]}
+    admin(x)
+    c=conn()
+    reconcile_license_owners(c)
+    rows=c.execute("SELECT * FROM licenses ORDER BY created_at DESC").fetchall()
+    result=[enriched_license(c,r) for r in rows]
+    c.close()
+    return {"success":True,"count":len(result),"licenses":result}
 
 @app.get("/api/admin/license/{key}")
 def license_detail(key:str,x:str|None=Header(default=None,alias="X-Admin-Secret")):
-    admin(x); c=conn(); r=c.execute("SELECT * FROM licenses WHERE license_key=?",(key.upper(),)).fetchone(); c.close()
-    if not r: raise HTTPException(404,"License not found.")
-    return {"success":True,"license":lic_dict(r)}
+    admin(x)
+    c=conn()
+    reconcile_license_owners(c)
+    r=c.execute("SELECT * FROM licenses WHERE license_key=?",(key.upper(),)).fetchone()
+    if not r:
+        c.close()
+        raise HTTPException(404,"License not found.")
+    result=enriched_license(c,r)
+    c.close()
+    return {"success":True,"license":result}
 
 @app.post("/api/admin/license/{key}/extend")
 def extend(key:str,b:Extend,x:str|None=Header(default=None,alias="X-Admin-Secret")):
@@ -253,11 +352,151 @@ def reset_hwid(b:KeyReq,x:str|None=Header(default=None,alias="X-Admin-Secret")):
 
 @app.get("/api/admin/users")
 def users(x:str|None=Header(default=None,alias="X-Admin-Secret")):
-    admin(x); c=conn(); us=c.execute("SELECT id,username,created_at,last_login_at,last_seen_at,disabled FROM users ORDER BY created_at DESC").fetchall(); out=[]
+    admin(x)
+    c=conn()
+    reconcile_license_owners(c)
+    us=c.execute(
+        "SELECT id,username,created_at,last_login_at,last_seen_at,disabled FROM users ORDER BY created_at DESC"
+    ).fetchall()
+
+    out=[]
     for u in us:
-        ls=c.execute("SELECT * FROM licenses WHERE owner_username=? ORDER BY activated_at DESC,created_at DESC",(u["username"],)).fetchall()
-        out.append({"id":u["id"],"username":u["username"],"created_at":u["created_at"],"last_login_at":u["last_login_at"],"last_seen_at":u["last_seen_at"],"online":online(u["last_seen_at"]),"disabled":bool(u["disabled"]),"licenses":[lic_dict(r) for r in ls]})
-    c.close(); return {"success":True,"count":len(out),"users":out}
+        ls=c.execute(
+            "SELECT * FROM licenses WHERE owner_username=? ORDER BY activated_at DESC,created_at DESC",
+            (u["username"],),
+        ).fetchall()
+
+        licenses_for_user=[enriched_license(c,r) for r in ls]
+        current=next(
+            (item for item in licenses_for_user if item["status"]=="active"),
+            licenses_for_user[0] if licenses_for_user else None,
+        )
+
+        out.append({
+            "id":u["id"],
+            "username":u["username"],
+            "created_at":u["created_at"],
+            "last_login_at":u["last_login_at"],
+            "last_seen_at":u["last_seen_at"],
+            "online":online(u["last_seen_at"]),
+            "disabled":bool(u["disabled"]),
+            "license_count":len(licenses_for_user),
+            "current_license":current,
+            "licenses":licenses_for_user,
+        })
+
+    unassigned=c.execute(
+        "SELECT COUNT(*) FROM licenses WHERE owner_username IS NULL OR TRIM(owner_username)=''"
+    ).fetchone()[0]
+    c.close()
+
+    return {
+        "success":True,
+        "count":len(out),
+        "unassigned_licenses":unassigned,
+        "users":out,
+    }
+
+@app.get("/api/admin/user/{username}")
+def user_detail(username:str,x:str|None=Header(default=None,alias="X-Admin-Secret")):
+    admin(x)
+    c=conn()
+    reconcile_license_owners(c)
+
+    u=c.execute(
+        "SELECT id,username,created_at,last_login_at,last_seen_at,disabled FROM users WHERE username=?",
+        (username,),
+    ).fetchone()
+
+    if not u:
+        c.close()
+        raise HTTPException(404,"User not found.")
+
+    ls=c.execute(
+        "SELECT * FROM licenses WHERE owner_username=? ORDER BY activated_at DESC,created_at DESC",
+        (username,),
+    ).fetchall()
+
+    licenses_for_user=[enriched_license(c,r) for r in ls]
+    current=next(
+        (item for item in licenses_for_user if item["status"]=="active"),
+        licenses_for_user[0] if licenses_for_user else None,
+    )
+
+    result={
+        "id":u["id"],
+        "username":u["username"],
+        "created_at":u["created_at"],
+        "last_login_at":u["last_login_at"],
+        "last_seen_at":u["last_seen_at"],
+        "online":online(u["last_seen_at"]),
+        "disabled":bool(u["disabled"]),
+        "license_count":len(licenses_for_user),
+        "current_license":current,
+        "licenses":licenses_for_user,
+    }
+
+    c.close()
+    return {"success":True,"user":result}
+
+@app.get("/api/admin/overview")
+def admin_overview(x:str|None=Header(default=None,alias="X-Admin-Secret")):
+    admin(x)
+    c=conn()
+    reconciled=reconcile_license_owners(c)
+
+    license_rows=c.execute(
+        "SELECT * FROM licenses ORDER BY created_at DESC"
+    ).fetchall()
+    licenses_out=[enriched_license(c,r) for r in license_rows]
+
+    user_rows=c.execute(
+        "SELECT id,username,created_at,last_login_at,last_seen_at,disabled FROM users ORDER BY created_at DESC"
+    ).fetchall()
+
+    users_out=[]
+    for u in user_rows:
+        owned=[item for item in licenses_out if item.get("owner_username")==u["username"]]
+        current=next(
+            (item for item in owned if item["status"]=="active"),
+            owned[0] if owned else None,
+        )
+        users_out.append({
+            "id":u["id"],
+            "username":u["username"],
+            "created_at":u["created_at"],
+            "last_login_at":u["last_login_at"],
+            "last_seen_at":u["last_seen_at"],
+            "online":online(u["last_seen_at"]),
+            "disabled":bool(u["disabled"]),
+            "license_count":len(owned),
+            "current_license":current,
+            "licenses":owned,
+        })
+
+    c.close()
+
+    return {
+        "success":True,
+        "reconciled":reconciled,
+        "users":users_out,
+        "licenses":licenses_out,
+        "counts":{
+            "users":len(users_out),
+            "licenses":len(licenses_out),
+            "assigned":sum(bool(item.get("owner_username")) for item in licenses_out),
+            "unassigned":sum(not bool(item.get("owner_username")) for item in licenses_out),
+            "online_users":sum(bool(item.get("online")) for item in users_out),
+        },
+    }
+
+@app.post("/api/admin/reconcile")
+def reconcile_admin_data(x:str|None=Header(default=None,alias="X-Admin-Secret")):
+    admin(x)
+    changed=reconcile_license_owners()
+    if changed:
+        audit("LICENSE_OWNER_RECONCILE",details=f"Recovered {changed} license owner mapping(s) from audit history.")
+    return {"success":True,"reconciled":changed}
 
 @app.post("/api/admin/user/{username}/disable")
 def disable(username:str,b:Toggle,x:str|None=Header(default=None,alias="X-Admin-Secret")):
@@ -291,13 +530,50 @@ def audit_api(x:str|None=Header(default=None,alias="X-Admin-Secret")):
 
 @app.get("/api/admin/stats")
 def stats(x:str|None=Header(default=None,alias="X-Admin-Secret")):
-    admin(x); c=conn(); rows=c.execute("SELECT * FROM licenses").fetchall(); users=c.execute("SELECT last_seen_at FROM users WHERE disabled=0").fetchall(); count=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]; c.close()
-    active=sum(lic_status(r)=="active" for r in rows); unused=sum(lic_status(r)=="not_activated" for r in rows); revoked=sum(lic_status(r)=="revoked" for r in rows); expired=sum(lic_status(r)=="expired" for r in rows)
-    return {"success":True,"total_keys":len(rows),"activated_keys":active,"unused_keys":unused,"revoked_keys":revoked,"expired_keys":expired,"users":count,"online_users":sum(online(r["last_seen_at"]) for r in users),"environment":APP_ENV,"maintenance":maintenance()}
+    admin(x)
+    c=conn()
+    reconcile_license_owners(c)
+    rows=c.execute("SELECT * FROM licenses").fetchall()
+    users=c.execute("SELECT last_seen_at FROM users WHERE disabled=0").fetchall()
+    count=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    assigned=c.execute("SELECT COUNT(*) FROM licenses WHERE owner_username IS NOT NULL AND TRIM(owner_username)!=''").fetchone()[0]
+    c.close()
+    active=sum(lic_status(r)=="active" for r in rows)
+    unused=sum(lic_status(r)=="not_activated" for r in rows)
+    revoked=sum(lic_status(r)=="revoked" for r in rows)
+    expired=sum(lic_status(r)=="expired" for r in rows)
+    return {
+        "success":True,
+        "total_keys":len(rows),
+        "activated_keys":active,
+        "unused_keys":unused,
+        "revoked_keys":revoked,
+        "expired_keys":expired,
+        "assigned_keys":assigned,
+        "unassigned_keys":len(rows)-assigned,
+        "users":count,
+        "online_users":sum(online(r["last_seen_at"]) for r in users),
+        "environment":APP_ENV,
+        "maintenance":maintenance(),
+        "database_path":str(DB),
+    }
 
 @app.get("/api/admin/settings")
 def settings(x:str|None=Header(default=None,alias="X-Admin-Secret")):
-    admin(x); return {"success":True,"maintenance":maintenance(),"environment":APP_ENV,"client_version":CLIENT_VERSION}
+    admin(x)
+    try:
+        size=DB.stat().st_size if DB.exists() else 0
+    except OSError:
+        size=0
+    return {
+        "success":True,
+        "maintenance":maintenance(),
+        "environment":APP_ENV,
+        "client_version":CLIENT_VERSION,
+        "database_path":str(DB),
+        "database_exists":DB.exists(),
+        "database_size":size,
+    }
 
 @app.post("/api/admin/maintenance")
 def set_maintenance(b:Maint,x:str|None=Header(default=None,alias="X-Admin-Secret")):
