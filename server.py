@@ -154,17 +154,17 @@ def login(request:Request,b:Auth):
     seen=iso(now()); c=conn(); c.execute("UPDATE users SET last_login_at=?,last_seen_at=? WHERE username=?",(seen,seen,r["username"])); c.commit(); c.close(); audit("USER_LOGIN",r["username"]); return {"success":True,"username":r["username"],"token":new_session(r["username"])}
 
 @app.post("/api/auth/logout")
-def logout(auth:str|None=Header(default=None)):
+def logout(auth:str|None=Header(default=None, alias="Authorization")):
     if auth:
         t=auth[7:].strip() if auth.startswith("Bearer ") else auth; u=user_from_auth(auth)
         c=conn(); c.execute("DELETE FROM sessions WHERE token_hash=?",(th(t),)); c.commit(); c.close(); audit("USER_LOGOUT",u)
     return {"success":True}
 
 @app.post("/api/auth/heartbeat")
-def heartbeat(auth:str|None=Header(default=None)): return {"success":True,"username":user_from_auth(auth),"server_time":iso(now())}
+def heartbeat(auth:str|None=Header(default=None, alias="Authorization")): return {"success":True,"username":user_from_auth(auth),"server_time":iso(now())}
 
 @app.get("/api/auth/me")
-def me(auth:str|None=Header(default=None)):
+def me(auth:str|None=Header(default=None, alias="Authorization")):
     u=user_from_auth(auth); c=conn()
     user=c.execute("SELECT username,created_at,last_login_at,last_seen_at,disabled FROM users WHERE username=?",(u,)).fetchone()
     lic=c.execute("SELECT * FROM licenses WHERE owner_username=? ORDER BY activated_at DESC,created_at DESC LIMIT 1",(u,)).fetchone()
@@ -172,7 +172,7 @@ def me(auth:str|None=Header(default=None)):
     return {"success":True,"account":dict(user)|{"online":online(user["last_seen_at"]),"disabled":bool(user["disabled"]),"license":lic_dict(lic) if lic else None}}
 
 @app.post("/api/license/activate")
-def activate(request:Request,b:LicenseReq,auth:str|None=Header(default=None)):
+def activate(request:Request,b:LicenseReq,auth:str|None=Header(default=None, alias="Authorization")):
     rate(request,"activate",limit=12); u=user_from_auth(auth); key=b.license_key.strip().upper()
     c=conn(); r=c.execute("SELECT * FROM licenses WHERE license_key=?",(key,)).fetchone()
     if not r: c.close(); raise HTTPException(404,"Invalid license key.")
@@ -188,7 +188,7 @@ def activate(request:Request,b:LicenseReq,auth:str|None=Header(default=None)):
     return {"success":True,"message":"License is valid.","seconds_remaining":left,"expires_at":r["expires_at"]}
 
 @app.post("/api/license/validate")
-def validate(b:LicenseReq,auth:str|None=Header(default=None)):
+def validate(b:LicenseReq,auth:str|None=Header(default=None, alias="Authorization")):
     u=user_from_auth(auth); c=conn(); r=c.execute("SELECT * FROM licenses WHERE license_key=?",(b.license_key.strip().upper(),)).fetchone(); c.close()
     if not r: raise HTTPException(404,"Invalid license key.")
     if r["revoked"]: raise HTTPException(403,"This license has been revoked.")
